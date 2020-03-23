@@ -1,0 +1,24 @@
+[tool.poetry]
+name = "covid-19"
+version = "0.1.0"
+description = ""
+authors = ["eferm <emanuel@eferm.com>"]
+license = "MIT"
+
+[tool.poetry.dependencies]
+python = "^3.8"
+pandas = "^1.0"
+numpy = "^1.18"
+requests = "^2.23"
+jupyter = "^1.0"
+ipynb = "pytest"
+matplotlib = "^3.2"
+sklearn = "^0.0.0"
+seaborn = "^0.10.0"
+
+[tool.poetry.dev-dependencies]
+pytest = "^5.4"
+
+[build-system]
+requires = ["poetry>=0.12"]
+build-backend = "poetry.masonry.api"
