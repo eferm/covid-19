@@ -1,7 +1,13 @@
 # covid-19
 data analysis and modeling of COVID-19.
 
-## how to clone/edit on a mac
+### examples
+
+![Example 1](img/example-1.png)
+![Example 2](img/example-2.png)
+
+
+### how to clone/edit on a mac
 1. have python 3 installed:
    1. `brew install pyenv`
    2. `pyenv install 3.8.X`
