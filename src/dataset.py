@@ -33,6 +33,7 @@ class PandasDataset(Dataset):
 
 	def transform(self, transform):
 		self.transformations.append(transform)
+		return self
 
 	def load(self):
 		self._load()
