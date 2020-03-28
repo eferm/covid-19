@@ -13,8 +13,8 @@ class JHU:
     3 different schemas that change over time. This pipeline therefore
     spends a fair bit of code normalizing data into a common shape."""
     
-    def __init__(self, refresh=False, verbose=False):
-        self._refresh = refresh
+    def __init__(self, force_refresh=False, verbose=False):
+        self._refresh = force_refresh
         self._verbose = verbose
     
     @property
@@ -336,8 +336,8 @@ class JHU:
 class CTP:
     """The COVID Tracking Project"""
     
-    def __init__(self, refresh=True, verbose=False):
-        self._refresh = refresh
+    def __init__(self, force_refresh=True, verbose=False):
+        self._refresh = force_refresh
         self._verbose = verbose
     
     @property
@@ -377,8 +377,8 @@ class CTP:
 class NYT:
     """The New York Times"""
     
-    def __init__(self, refresh=True, verbose=False):
-        self._refresh = refresh
+    def __init__(self, force_refresh=True, verbose=False):
+        self._refresh = force_refresh
         self._verbose = verbose
     
     @property
