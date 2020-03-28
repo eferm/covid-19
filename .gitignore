@@ -133,3 +133,5 @@ cache/
 
 .idea/*
 *.idea
+
+env_py
