@@ -3,6 +3,7 @@ import requests
 
 
 CACHE_DIR = Path('..', 'cache')
+DATA_DIR = Path('..', 'data')
 
 # US/Canada states/province/territory mapping
 ISO_3166_2 = {
@@ -102,3 +103,9 @@ def _cache_input(filepath, text):
     with open(path, 'w') as f:
         f.write(text)
     return path
+
+
+def write_csv(df, filename):
+    path = DATA_DIR.joinpath(filename)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(path, index=False)

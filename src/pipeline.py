@@ -68,13 +68,13 @@ class JHU:
             for date in schema['dates']:
                 filename = f"{date.strftime('%m-%d-%Y')}.csv"
                 filepath = Path(source['repo'], source['branch'], source['dir'], filename)
-                printif(verbose, f"Read {filepath.name}...")
+                printif(verbose, f"Read '{filepath.name}'...")
                 try:
                     file = get_file(source['url'], filepath, refresh=refresh, verbose=verbose)
                     df = pd.read_csv(file, **schema['kwargs']).assign(filedate=date)
                     files_dfs.append(df)
                 except:
-                    printif(verbose, f"Skipping file {filepath.name} as it does not exist.")
+                    printif(verbose, f"Skipping file {filepath.name} as it does not yet exist.")
 
             # validate schemas
             columns = list(map(lambda df: set(df.columns), files_dfs))
@@ -200,8 +200,6 @@ class JHU:
         df['country_region'] = df['country_region'].str.strip()
         df['province_state'] = df['province_state'].str.strip()
 
-        df['day'] = df['filedate'].dt.strftime('%Y-%m-%d')
-
         # resolve dirty labels
         # for older data this will resolve mixed county/state information to the state
         # i.e. it will lose some older county information
@@ -220,18 +218,12 @@ class JHU:
         # resolve dirty countries
         df['country_region'] = df['country_region'].replace(self.get_country_resolution())
 
-        renames = {
-            'country_region': 'country',
-            'province_state': 'state',
-            'admin2': 'county',
-        }
-
         return (
             df
-            .rename(columns=renames)
+            .rename(columns={'filedate': 'date'})
             .assign(
-                state=lambda df: df['state'].fillna(df['country']),
-                county=lambda df: df['county'].fillna(df['state'])
+                province_state=lambda df: df['province_state'].fillna(df['country_region']),
+                admin2=lambda df: df['admin2'].fillna(df['province_state'])
             )
             # sum together resolved countries/states
             # before:
@@ -242,7 +234,7 @@ class JHU:
             # after:
             # country,        state, deaths,         last_update
             #      US,   California,      5, 2020-02-09 03:00:00
-            .groupby(['filedate', 'day', 'country', 'state', 'county'])
+            .groupby(['date', 'country_region', 'province_state', 'admin2'])
             .agg({
                 'confirmed': sum,
                 'deaths': sum,
@@ -251,7 +243,7 @@ class JHU:
                 '_province_state': list,
             })
             .reset_index()
-            .sort_values(['filedate', 'country', 'state', 'county'])
+            .sort_values(['date', 'country_region', 'province_state', 'admin2'])
             .reset_index(drop=True)
         )
     
@@ -358,7 +350,7 @@ class CTP:
             'filepath': Path('states/daily.csv'),
         }
         file = get_file(source['url'], source['filepath'], refresh=refresh, verbose=verbose)
-        df = pd.read_csv(file, parse_dates=['dateChecked'])
+        df = pd.read_csv(file, parse_dates=['dateChecked', 'date'])
         self._timestamp = max(df['dateChecked']).strftime("%Y-%m-%d %H:%M:%S")
         return df
 
@@ -407,7 +399,64 @@ class NYT:
         return df
 
     def _clean(self, df):
-        df = df.copy()
-        df['fips'] = df['fips'].astype('Int64')
-        df = df.sort_values(['date', 'state', 'county']).reset_index(drop=True)
+        return (
+            df
+            .copy()
+            .assign(fips=lambda df: df['fips'].astype('Int64'))
+            .sort_values(['date', 'state', 'county']).reset_index(drop=True)
+        )
+
+
+class DPC:
+    """Presidenza del Consiglio dei Ministri - Dipartimento della Protezione Civile
+    Region-level data from Italy."""
+    
+    def __init__(self, force_refresh=True, verbose=False):
+        self._refresh = force_refresh
+        self._verbose = verbose
+    
+    @property
+    def raw(self):
+        return self._get_data(self._refresh, self._verbose)
+
+    @property
+    def clean(self):
+        return self.raw.pipe(self._clean)
+    
+    @property
+    def timestamp(self):
+        return self._timestamp if hasattr(self, '_timestamp') else None
+
+    def _get_data(self, refresh, verbose):
+        """Download or fetch data from cache.
+
+        Returns:
+            DataFrame: Raw data.
+        """
+        # https://raw.githubusercontent.com/pcm-dpc/COVID-19/master/
+        # dati-regioni/dpc-covid19-ita-regioni.csv
+        source = {
+            'url': 'https://raw.githubusercontent.com',
+            'repo': 'pcm-dpc/COVID-19',
+            'branch': 'master',
+            'dir': 'dati-regioni',
+            'filename': 'dpc-covid19-ita-regioni.csv',
+        }
+        
+        filepath = Path(source['repo'], source['branch'], source['dir'], source['filename'])
+        file = get_file(source['url'], filepath, refresh=refresh, verbose=verbose)
+        df = pd.read_csv(file, parse_dates=['data'])
+        self._timestamp = max(df['data']).strftime("%Y-%m-%d %H:%M:%S")
         return df
+
+    def _clean(self, df):
+        """Returns:
+            DataFrame: Clean data
+        """
+        df = df.copy()
+        return (
+            df
+            .assign(date=lambda df: df['data'].astype('<M8[D]'))
+            .sort_values(['date', 'codice_regione'])
+            .reset_index(drop=True)
+        )
