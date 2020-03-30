@@ -5,7 +5,8 @@ data analysis and modeling of COVID-19
 - global metrics from Johns Hopkins University https://github.com/CSSEGISandData/COVID-19
 - US county-level metrics from The New York Times https://github.com/nytimes/covid-19-data
 - Italy *regione*-level metrics from Dipartimento della Protezione Civile https://github.com/pcm-dpc/COVID-19
-- all data sources are timeseries with updated cumulative metrics for each day
+
+all data sources are timeseries with updated cumulative metrics for each day
 
 ### metrics
 - cum. `cases`, `deaths`, and `recovered`, for most regions
