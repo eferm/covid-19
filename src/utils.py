@@ -1,6 +1,8 @@
+import re
 from pathlib import Path
-import requests
 
+import requests
+import pandas as pd
 
 CACHE_DIR = Path('..', 'cache')
 DATA_DIR = Path('..', 'data')
@@ -70,13 +72,42 @@ ISO_3166_2 = {
     }
 
 
+def underscore(s):
+    """camelCase to under_score"""
+    s = re.sub(r'(?<!^)(?=[A-Z])', '_', s).lower()
+    return s
+
+
 def printif(flag, text):
     if flag:
         print(text)
 
 
-def get_file(url, filepath, refresh=False, verbose=False):
-    filepath = Path(filepath)
+def get_df(url, path, refresh, verbose, errors, **pandas_kwargs):
+    """Retrieve DataFrame from either server or local cache.
+    """
+    path = Path(path)
+    printif(verbose, f"Reading '{path.name}'...")
+    try:
+        file = get_file(url, path, refresh=refresh, verbose=verbose)
+        df = pd.read_csv(file, **pandas_kwargs)
+        return df
+    except requests.HTTPError:
+        printif(verbose, f"Could not find {path.name} on server.")
+        if errors == 'raise':
+            raise
+    except Exception:
+        printif(verbose, "Unknown exception")
+        raise
+
+
+def get_file(url, path, refresh=False, verbose=False):
+    """Either download file from `url/filepath`,
+    or retrieve cached file from `host/filepath`
+    """
+    host = re.sub(r'^https?://(?:www\.)?', '', url)
+    filepath = Path(host, path)
+
     if not refresh:
         cached_input = _get_cached_input(filepath)
         if cached_input:
@@ -84,7 +115,7 @@ def get_file(url, filepath, refresh=False, verbose=False):
             return cached_input
 
     printif(verbose, f"No cached file '{filepath.name}', fetching from server...")
-    resp = requests.get(f"{url}/{filepath}")
+    resp = requests.get(f"{url}/{path}")
     resp.raise_for_status()
     
     printif(verbose, f"Fetched file '{filepath.name}'. Caching for later.")

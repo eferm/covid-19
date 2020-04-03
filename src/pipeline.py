@@ -1,33 +1,140 @@
 import re
+import abc
 import datetime as dt
 from pathlib import Path
 
+import requests
 import pandas as pd
 import numpy as np
 
-from utils import get_file, printif, ISO_3166_2
+from utils import get_df, underscore, ISO_3166_2
 
 
-class JHU:
-    """Note that data source consists of 1 file per day, and (so far)
-    3 different schemas that change over time. This pipeline therefore
-    spends a fair bit of code normalizing data into a common shape."""
-    
-    def __init__(self, force_refresh=False, verbose=False):
+class DataSource(abc.ABC):
+    """A data source.
+    """
+    def __init__(self, name, shortname, force_refresh, verbose):
+        self.name = name
+        self.shortname = shortname
+        # private
         self._refresh = force_refresh
         self._verbose = verbose
-    
+        self._raw = None
+        self._clean = None
+
+    @property
+    @abc.abstractmethod
+    def raw(self):
+        pass
+
+    @property
+    @abc.abstractmethod
+    def clean(self):
+        pass
+
+
+class ECDC(DataSource):
+    """European Centre for Disease Prevention and Control
+    """
+    def __init__(self, force_refresh=True, verbose=False):
+        super(ECDC, self).__init__(
+            'European Centre for Disease Prevention and Control',
+            'ECDC',
+            force_refresh,
+            verbose
+        )
+        self.host = 'https://opendata.ecdc.europa.eu'
+        self.path = 'covid19/casedistribution/csv'
+
     @property
     def raw(self):
-        return self._consolidate(self._get_data(self._refresh, self._verbose))
+
+        if self._raw is not None:
+            return self._raw
+
+        df = get_df(
+            self.host,
+            self.path,
+            self._refresh,
+            self._verbose,
+            errors='raise',
+            parse_dates=['dateRep'],
+            dayfirst=True,
+        )
+        self._raw = df  # cache
+        return df
 
     @property
     def clean(self):
-        return self.raw.pipe(self._patch).pipe(self._clean)
+
+        if self._clean is not None:
+            return self._clean
+
+        df = (
+            self.raw
+            .rename(columns=underscore)
+            .replace(r'_', ' ', regex=True)
+            .replace({
+                'United Kingdom': 'UK',
+                'United States of America': 'US',
+            })
+            .assign(date=lambda df: df['date_rep'])
+            .sort_values(['date', 'countries_and_territories'])
+            .reset_index(drop=True)
+        )
+
+        # adjust date for tz
+        df.loc[:, ['date']] = df.groupby('countries_and_territories')['date'].shift()
+        
+        # make metrics cumulative
+        df.loc[:, ['cases', 'deaths']] = (
+            df
+            .groupby('countries_and_territories')
+            [['cases', 'deaths']]
+            .cumsum()
+        )
+        self._clean = df  # cache
+        return df
+
+
+class JHU(DataSource):
+    """Johns Hopkins University
+    Center for Systems Science and Engineering
+    """
+    def __init__(self, force_refresh=False, verbose=False):
+        super(JHU, self).__init__(
+            'Johns Hopkins University',
+            'JHU',
+            force_refresh,
+            verbose
+        )
+        self.host = 'https://raw.githubusercontent.com'
+        self.path = 'CSSEGISandData/COVID-19' \
+            + '/master/csse_covid_19_data/csse_covid_19_daily_reports'
     
     @property
-    def timestamp(self):
-        return self._timestamp if hasattr(self, '_timestamp') else None
+    def raw(self):
+
+        if self._raw is not None:
+            return self._raw
+
+        dfs = self._get_data(self._refresh, self._verbose)
+        df = self._consolidate(dfs)
+        self._raw = df  # cache
+        return df
+
+    @property
+    def clean(self):
+        if self._clean is not None:
+            return self._clean
+
+        df = (
+            self.raw
+            .pipe(self._patch_errors)
+            .pipe(self._clean_and_resolve)
+        )
+        self._clean = df  # cache
+        return df
 
     def _get_data(self, refresh, verbose):
         """Download or fetch data from cache.
@@ -38,14 +145,6 @@ class JHU:
         Returns:
             List[DataFrame]: One DataFrame for each schema version.
         """
-
-        source = {
-            'url': 'https://raw.githubusercontent.com',
-            'repo': 'CSSEGISandData/COVID-19',
-            'branch': 'master',
-            'dir': 'csse_covid_19_data/csse_covid_19_daily_reports',
-        }
-
         schemas = {
             '20200122': {
                 'dates': pd.date_range('2020-01-22', '2020-02-29'),
@@ -67,15 +166,16 @@ class JHU:
             files_dfs = []
             for date in schema['dates']:
                 filename = f"{date.strftime('%m-%d-%Y')}.csv"
-                filepath = Path(source['repo'], source['branch'], source['dir'], filename)
-                printif(verbose, f"Read '{filepath.name}'...")
-                try:
-                    file = get_file(source['url'], filepath, refresh=refresh, verbose=verbose)
-                    df = pd.read_csv(file, **schema['kwargs']).assign(filedate=date)
-                    files_dfs.append(df)
-                except:
-                    printif(verbose, f"Skipping file {filepath.name} as it does not yet exist.")
-
+                df = get_df(
+                    self.host,
+                    f"{self.path}/{filename}",
+                    refresh,
+                    verbose,
+                    errors='ignore',
+                    **schema['kwargs']
+                )
+                if df is not None:
+                    files_dfs.append(df.assign(_filedate=date, _filename=filename))
             # validate schemas
             columns = list(map(lambda df: set(df.columns), files_dfs))
             assert all(x == columns[0] for x in columns), f"schemas differ for {schema_name}"
@@ -100,12 +200,12 @@ class JHU:
 
             df_by_schema['20200122']
             .rename(columns=normalize)
-            .assign(admin2=None),
+            .assign(admin2=np.nan),
 
             df_by_schema['20200301']
             .drop(['Latitude', 'Longitude'], axis=1)
             .rename(columns=normalize)
-            .assign(admin2=None),
+            .assign(admin2=np.nan),
 
             df_by_schema['20200322']
             .drop(['FIPS', 'Lat', 'Long_', 'Active', 'Combined_Key'], axis=1)
@@ -114,7 +214,8 @@ class JHU:
 
         # reindex
         cols = [
-            'filedate',
+            '_filedate',
+            '_filename',
             'country_region',
             'province_state',
             'admin2',
@@ -128,14 +229,14 @@ class JHU:
         self._timestamp = max(df['last_update']).strftime("%Y-%m-%d %H:%M:%S")
         return df
 
-    def _patch(self, df):
+    def _patch_errors(self, df):
         """Fix spot errors in data.
 
         Returns:
             DataFrame: Patched data
         """
-        def row_index(filedate, country=None, state=None):
-            idx = df['filedate'] == pd.to_datetime(filedate)
+        def row(filedate, country=None, state=None):
+            idx = df['_filedate'] == pd.to_datetime(filedate)
             if country:
                 idx &= df['country_region'] == country
             if state:
@@ -145,50 +246,23 @@ class JHU:
         df = df.copy()
 
         # there are 5 cases in Travis, CA that were later attributed to Diamond Princess
-        df.loc[row_index('2020-02-21', state='Travis, CA'), 'confirmed'] = 0
-
-        # 2020-03-12
-        # 2020-03-15
-        # source: https://www.worldometers.info/coronavirus/
-        series = 'confirmed'
-        df.loc[row_index('2020-03-12', 'Italy'), series] = 15113
-        df.loc[row_index('2020-03-12', 'France'), series] = 2876
-        df.loc[row_index('2020-03-12', 'Spain'), series] = 3146
-        df.loc[row_index('2020-03-12', 'Germany'), series] = 2745
-        df.loc[row_index('2020-03-12', 'United Kingdom'), series] = 590
-
-        df.loc[row_index('2020-03-15', 'France'), series] = 5423
-        df.loc[row_index('2020-03-15', 'United Kingdom'), series] = 1391
-
-        series = 'deaths'
-        df.loc[row_index('2020-03-12', 'Italy'), series] = 1016
-        df.loc[row_index('2020-03-12', 'France'), series] = 61
-        df.loc[row_index('2020-03-12', 'Spain'), series] = 86
-        df.loc[row_index('2020-03-12', 'Germany'), series] = 6
-        df.loc[row_index('2020-03-12', 'United Kingdom'), series] = 10
-
-        df.loc[row_index('2020-03-15', 'France'), series] = 127
-        df.loc[row_index('2020-03-15', 'United Kingdom'), series] = 35
-
-        series = 'recovered'
-        df.loc[row_index('2020-03-12', 'Italy'), series] = 1258
-        df.loc[row_index('2020-03-12', 'Spain'), series] = 189
+        df.loc[row('2020-02-21', state='Travis, CA'), 'confirmed'] = 0
 
         # fill in estimated data to Hubei
         # useful for offset plots which origin from cases >= 100 and deaths >= 10
         # values estimated using Excel's GROWTH function, using the first 10 values
         china_patch = pd.DataFrame(
-            [(dt.datetime(2020, 1, 18), 'China', 'Hubei', None, 96, 4, np.nan, None),
-             (dt.datetime(2020, 1, 19), 'China', 'Hubei', None, 132, 6, np.nan, None),
-             (dt.datetime(2020, 1, 20), 'China', 'Hubei', None, 182, 8, np.nan, None),
-             (dt.datetime(2020, 1, 21), 'China', 'Hubei', None, 250, 11, np.nan, None),
+            [(dt.datetime(2020, 1, 18), '', 'China', 'Hubei', None, 96, 4, np.nan, None),
+             (dt.datetime(2020, 1, 19), '', 'China', 'Hubei', None, 132, 6, np.nan, None),
+             (dt.datetime(2020, 1, 20), '', 'China', 'Hubei', None, 182, 8, np.nan, None),
+             (dt.datetime(2020, 1, 21), '', 'China', 'Hubei', None, 250, 11, np.nan, None),
             ],
             columns=df.columns)
         df = pd.concat([df, china_patch])
 
         return df
 
-    def _clean(self, df):
+    def _clean_and_resolve(self, df):
         """Clean and resolve country/state value labels.
 
         Returns:
@@ -196,7 +270,6 @@ class JHU:
         """
         df = df.copy()
 
-        df = df.replace({np.nan: None})  # np.nan -> None
         df['country_region'] = df['country_region'].str.strip()
         df['province_state'] = df['province_state'].str.strip()
 
@@ -213,17 +286,18 @@ class JHU:
         #      US,        California,      2, 2020-02-09 01:00:00
         #      US,        California,      2, 2020-02-09 02:00:00
         #      US,        California,      1, 2020-02-09 03:00:00
-        df['_province_state'] = df['province_state']  # store orig value
-        df['province_state'] = df['province_state'].replace(self.get_state_resolution(df))
+        df['province_state_grouped'] = df['province_state']  # store orig value
+        df['province_state'] = df['province_state'].replace(self._get_state_resolution(df))
         # resolve dirty countries
-        df['country_region'] = df['country_region'].replace(self.get_country_resolution())
+        df['country_region'] = df['country_region'].replace(self._get_country_resolution())
 
         return (
             df
-            .rename(columns={'filedate': 'date'})
             .assign(
-                province_state=lambda df: df['province_state'].fillna(df['country_region']),
-                admin2=lambda df: df['admin2'].fillna(df['province_state'])
+                date=lambda df: df['_filedate'],
+                # for groupby
+                province_state=lambda df: df['province_state'].fillna(""),
+                admin2=lambda df: df['admin2'].fillna("")
             )
             # sum together resolved countries/states
             # before:
@@ -234,21 +308,23 @@ class JHU:
             # after:
             # country,        state, deaths,         last_update
             #      US,   California,      5, 2020-02-09 03:00:00
-            .groupby(['date', 'country_region', 'province_state', 'admin2'])
+            .groupby(['date', 'country_region', 'province_state', 'admin2',
+                      '_filedate', '_filename'])
             .agg({
                 'confirmed': sum,
                 'deaths': sum,
                 'recovered': sum,
                 'last_update': max,
-                '_province_state': list,
+                'province_state_grouped': list,
             })
             .reset_index()
+            .replace(r'^\s*$', np.nan, regex=True)
             .sort_values(['date', 'country_region', 'province_state', 'admin2'])
             .reset_index(drop=True)
         )
     
     @staticmethod
-    def get_country_resolution():
+    def _get_country_resolution():
         # this dict not meant to start holy wars
         return {
             'Bahamas, The': 'Bahamas',
@@ -275,7 +351,7 @@ class JHU:
         }
     
     @staticmethod
-    def get_state_resolution(df):
+    def _get_state_resolution(df):
 
         oneoffs = {
             # US
@@ -298,6 +374,7 @@ class JHU:
         df = (
             df
             .copy()
+            .replace({np.nan: None})  # needed to avoid mapping from np.nan
             .loc[df['country_region'].isin(['US', 'Canada', 'UK', 'France']), ['province_state']]
             .rename(columns={'province_state': 'raw'})
             .drop_duplicates()
@@ -325,138 +402,144 @@ class JHU:
         return d
 
 
-class CTP:
-    """The COVID Tracking Project"""
-    
+class CTP(DataSource):
+    """The COVID Tracking Project
+    """
     def __init__(self, force_refresh=True, verbose=False):
-        self._refresh = force_refresh
-        self._verbose = verbose
+        super(CTP, self).__init__(
+            'The COVID Tracking Project',
+            'CTP',
+            force_refresh,
+            verbose
+        )
+        self.host = 'http://covidtracking.com'
+        self.path = 'api/states/daily.csv'
     
     @property
     def raw(self):
-        return self._get_data(self._refresh, self._verbose)
+
+        if self._raw is not None:
+            return self._raw
+
+        df = get_df(
+            self.host,
+            self.path,
+            self._refresh,
+            self._verbose,
+            errors='raise',
+            parse_dates=['dateChecked', 'date'],
+        )
+        self._raw = df  # cache
+        return df
 
     @property
     def clean(self):
-        return self.raw.pipe(self._clean)
-    
-    @property
-    def timestamp(self):
-        return self._timestamp if hasattr(self, '_timestamp') else None
 
-    def _get_data(self, refresh, verbose):
-        source = {
-            'url': 'http://covidtracking.com/api',
-            'filepath': Path('states/daily.csv'),
-        }
-        file = get_file(source['url'], source['filepath'], refresh=refresh, verbose=verbose)
-        df = pd.read_csv(file, parse_dates=['dateChecked', 'date'])
-        self._timestamp = max(df['dateChecked']).strftime("%Y-%m-%d %H:%M:%S")
-        return df
+        if self._clean is not None:
+            return self._clean
 
-    def _clean(self, df):
-        def normalize(s):
-            s = re.sub(r'(?<!^)(?=[A-Z])', '_', s).lower()
-            return s
-        df = self.raw.rename(columns=normalize)
         # map AK -> Alaska
         states = dict(map(reversed, ISO_3166_2.items()))
-        df['state'] = df['state'].map(states)
-        df = df.sort_values(['date', 'state']).reset_index(drop=True)
+        df = (
+            self.raw
+            .rename(columns=underscore)
+            .assign(state=lambda df: df['state'].map(states))
+            .sort_values(['date', 'state'])
+            .reset_index(drop=True)
+        )
+        self._clean = df  # cache
         return df
 
 
-class NYT:
+class NYT(DataSource):
     """The New York Times"""
     
     def __init__(self, force_refresh=True, verbose=False):
-        self._refresh = force_refresh
-        self._verbose = verbose
-    
-    @property
-    def raw(self):
-        return self._get_data(self._refresh, self._verbose)
-
-    @property
-    def clean(self):
-        return self.raw.pipe(self._clean)
-    
-    @property
-    def timestamp(self):
-        return self._timestamp if hasattr(self, '_timestamp') else None
-
-    def _get_data(self, refresh, verbose):
-        source = {
-            'url': 'https://raw.githubusercontent.com',
-            'repo': 'nytimes/covid-19-data',
-            'branch': 'master',
-            'filename': 'us-counties.csv',
-        }
-        filepath = Path(source['repo'], source['branch'], source['filename'])
-        file = get_file(source['url'], filepath, refresh=refresh, verbose=verbose)
-        df = pd.read_csv(file, parse_dates=['date'])
-        self._timestamp = max(df['date']).strftime("%Y-%m-%d %H:%M:%S")
-        return df
-
-    def _clean(self, df):
-        return (
-            df
-            .copy()
-            .assign(fips=lambda df: df['fips'].astype('Int64'))
-            .sort_values(['date', 'state', 'county']).reset_index(drop=True)
+        super(NYT, self).__init__(
+            'The New York Times',
+            'NYT',
+            force_refresh,
+            verbose
         )
-
-
-class DPC:
-    """Presidenza del Consiglio dei Ministri - Dipartimento della Protezione Civile
-    Region-level data from Italy."""
-    
-    def __init__(self, force_refresh=True, verbose=False):
-        self._refresh = force_refresh
-        self._verbose = verbose
+        self.host = 'https://raw.githubusercontent.com'
+        self.path = 'nytimes/covid-19-data/master/us-counties.csv'
     
     @property
     def raw(self):
-        return self._get_data(self._refresh, self._verbose)
+
+        if self._raw is not None:
+            return self._raw
+
+        df = get_df(
+            self.host,
+            self.path,
+            self._refresh,
+            self._verbose,
+            errors='raise',
+            parse_dates=['date'],
+        )
+        self._raw = df  # cache
+        return df
 
     @property
     def clean(self):
-        return self.raw.pipe(self._clean)
-    
-    @property
-    def timestamp(self):
-        return self._timestamp if hasattr(self, '_timestamp') else None
 
-    def _get_data(self, refresh, verbose):
-        """Download or fetch data from cache.
+        if self._clean is not None:
+            return self._clean
 
-        Returns:
-            DataFrame: Raw data.
-        """
-        # https://raw.githubusercontent.com/pcm-dpc/COVID-19/master/
-        # dati-regioni/dpc-covid19-ita-regioni.csv
-        source = {
-            'url': 'https://raw.githubusercontent.com',
-            'repo': 'pcm-dpc/COVID-19',
-            'branch': 'master',
-            'dir': 'dati-regioni',
-            'filename': 'dpc-covid19-ita-regioni.csv',
-        }
-        
-        filepath = Path(source['repo'], source['branch'], source['dir'], source['filename'])
-        file = get_file(source['url'], filepath, refresh=refresh, verbose=verbose)
-        df = pd.read_csv(file, parse_dates=['data'])
-        self._timestamp = max(df['data']).strftime("%Y-%m-%d %H:%M:%S")
+        df = (
+            self.raw
+            .assign(fips=lambda df: df['fips'].astype('Int64'))
+            .sort_values(['date', 'state', 'county'])
+            .reset_index(drop=True)
+        )
+        self._clean = df  # cache
         return df
 
-    def _clean(self, df):
-        """Returns:
-            DataFrame: Clean data
-        """
-        df = df.copy()
-        return (
-            df
+
+class DPC(DataSource):
+    """Dipartimento della Protezione Civile
+    Presidenza del Consiglio dei Ministri
+    """
+    def __init__(self, force_refresh=True, verbose=False):
+        super(DPC, self).__init__(
+            'Dipartimento della Protezione Civile',
+            'DPC',
+            force_refresh,
+            verbose
+        )
+        self.host = 'https://raw.githubusercontent.com'
+        self.path = 'pcm-dpc/COVID-19' \
+            + '/master/dati-regioni/dpc-covid19-ita-regioni.csv'
+    
+    @property
+    def raw(self):
+
+        if self._raw is not None:
+            return self._raw
+
+        df = get_df(
+            self.host,
+            self.path,
+            self._refresh,
+            self._verbose,
+            errors='raise',
+            parse_dates=['data'],
+        )
+        self._raw = df  # cache
+        return df
+
+    @property
+    def clean(self):
+
+        if self._clean is not None:
+            return self._clean
+
+        df = (
+            self.raw
             .assign(date=lambda df: df['data'].astype('<M8[D]'))
             .sort_values(['date', 'codice_regione'])
             .reset_index(drop=True)
         )
+        self._clean = df  # cache
+        return df
