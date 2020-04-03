@@ -35,6 +35,9 @@ class DataSource(abc.ABC):
 
 class ECDC(DataSource):
     """European Centre for Disease Prevention and Control
+    
+    Source: https://www.ecdc.europa.eu/en/publications-data/
+    download-todays-data-geographic-distribution-covid-19-cases-worldwide
     """
     def __init__(self, force_refresh=True, verbose=False):
         super(ECDC, self).__init__(
@@ -60,6 +63,7 @@ class ECDC(DataSource):
             errors='raise',
             parse_dates=['dateRep'],
             dayfirst=True,
+            keep_default_na=False,  # don't treat Namibia as 'NA'
         )
         self._raw = df  # cache
         return df
@@ -82,16 +86,58 @@ class ECDC(DataSource):
             .sort_values(['date', 'countries_and_territories'])
             .reset_index(drop=True)
         )
-
+        
         # adjust date for tz
         df.loc[:, ['date']] = df.groupby('countries_and_territories')['date'].shift()
-        
+        df = df.loc[df['date'].notnull()]
+
         # make metrics cumulative
         df.loc[:, ['cases', 'deaths']] = (
             df
             .groupby('countries_and_territories')
             [['cases', 'deaths']]
             .cumsum()
+        )
+
+        # filter out last values if they're suddenly 0
+        prev = ['prev_cases', 'prev_deaths']
+        df = df.assign(
+            prev_cases=df['cases'],
+            prev_deaths=df['deaths']
+        )
+        df.loc[:, prev] = (
+            df
+            .groupby('countries_and_territories')
+            [prev]
+            .shift()
+        )
+
+        idx = (
+            df
+            .reset_index()
+            .groupby('countries_and_territories')
+            [['index', 'cases', 'deaths', *prev]]
+            .last()
+            .loc[lambda df: (df['cases'] == df['prev_cases'])
+                 & (df['deaths'] == df['prev_deaths'])]
+            ['index']
+        )
+        df = (
+            df
+            .drop(index=idx)
+            .drop(columns=['prev_cases', 'prev_deaths'])
+        )
+        
+        # forward fill missing values
+        df = (
+            df
+            .set_index('date')
+            .groupby('countries_and_territories')
+            .resample('D')
+            .ffill()
+            .interpolate()
+            .drop(columns=['countries_and_territories'])
+            .reset_index()
         )
         self._clean = df  # cache
         return df
